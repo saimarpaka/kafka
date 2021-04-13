@@ -37,6 +37,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -81,8 +82,8 @@ public class StreamsConfigTest {
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
-        props.put("key.deserializer.encoding", "UTF8");
-        props.put("value.deserializer.encoding", "UTF-16");
+        props.put("key.deserializer.encoding", StandardCharsets.UTF_8.name());
+        props.put("value.deserializer.encoding", StandardCharsets.UTF_16.name());
         streamsConfig = new StreamsConfig(props);
     }
 
@@ -208,8 +209,8 @@ public class StreamsConfigTest {
     @Test
     public void defaultSerdeShouldBeConfigured() {
         final Map<String, Object> serializerConfigs = new HashMap<>();
-        serializerConfigs.put("key.serializer.encoding", "UTF8");
-        serializerConfigs.put("value.serializer.encoding", "UTF-16");
+        serializerConfigs.put("key.serializer.encoding", StandardCharsets.UTF_8.name());
+        serializerConfigs.put("value.serializer.encoding", StandardCharsets.UTF_16.name());
         final Serializer<String> serializer = Serdes.String().serializer();
 
         final String str = "my string for testing";
@@ -904,26 +905,6 @@ public class StreamsConfigTest {
     public void shouldThrowConfigExceptionWhenOptimizationConfigNotValueInRange() {
         props.put(TOPOLOGY_OPTIMIZATION_CONFIG, "maybe");
         assertThrows(ConfigException.class, () -> new StreamsConfig(props));
-    }
-
-    @SuppressWarnings("deprecation")
-    @Test
-    public void shouldLogWarningWhenPartitionGrouperIsUsed() {
-        props.put(
-            StreamsConfig.PARTITION_GROUPER_CLASS_CONFIG,
-            org.apache.kafka.streams.processor.DefaultPartitionGrouper.class
-        );
-
-        LogCaptureAppender.setClassLoggerToDebug(StreamsConfig.class);
-        try (final LogCaptureAppender appender = LogCaptureAppender.createAndRegister(StreamsConfig.class)) {
-            new StreamsConfig(props);
-
-            assertThat(
-                appender.getMessages(),
-                hasItem("Configuration parameter `" + StreamsConfig.PARTITION_GROUPER_CLASS_CONFIG +
-                    "` is deprecated and will be removed in 3.0.0 release.")
-            );
-        }
     }
 
     @SuppressWarnings("deprecation")

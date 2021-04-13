@@ -16,6 +16,13 @@
  */
 package org.apache.kafka.streams.processor.internals;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.BufferedWriter;
+import java.io.FileOutputStream;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Utils;
@@ -54,6 +61,7 @@ import static org.apache.kafka.common.utils.Utils.mkEntry;
 import static org.apache.kafka.common.utils.Utils.mkMap;
 import static org.apache.kafka.common.utils.Utils.mkSet;
 import static org.apache.kafka.streams.processor.internals.StateDirectory.LOCK_FILE_NAME;
+import static org.apache.kafka.streams.processor.internals.StateDirectory.PROCESS_FILE_NAME;
 import static org.apache.kafka.streams.processor.internals.StateManagerUtil.CHECKPOINT_FILE_NAME;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.endsWith;
@@ -69,7 +77,6 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-
 
 public class StateDirectoryTest {
 
@@ -145,33 +152,15 @@ public class StateDirectoryTest {
     @Test
     public void shouldCreateTaskStateDirectory() {
         final TaskId taskId = new TaskId(0, 0);
-        final File taskDirectory = directory.directoryForTask(taskId);
+        final File taskDirectory = directory.getOrCreateDirectoryForTask(taskId);
         assertTrue(taskDirectory.exists());
         assertTrue(taskDirectory.isDirectory());
     }
 
     @Test
-    public void shouldLockTaskStateDirectory() throws IOException {
+    public void shouldBeTrueIfAlreadyHoldsLock() {
         final TaskId taskId = new TaskId(0, 0);
-        final File taskDirectory = directory.directoryForTask(taskId);
-
-        directory.lock(taskId);
-
-        try (
-            final FileChannel channel = FileChannel.open(
-                new File(taskDirectory, LOCK_FILE_NAME).toPath(),
-                StandardOpenOption.CREATE, StandardOpenOption.WRITE)
-        ) {
-            assertThrows(OverlappingFileLockException.class, channel::tryLock);
-        } finally {
-            directory.unlock(taskId);
-        }
-    }
-
-    @Test
-    public void shouldBeTrueIfAlreadyHoldsLock() throws IOException {
-        final TaskId taskId = new TaskId(0, 0);
-        directory.directoryForTask(taskId);
+        directory.getOrCreateDirectoryForTask(taskId);
         directory.lock(taskId);
         try {
             assertTrue(directory.lock(taskId));
@@ -181,7 +170,7 @@ public class StateDirectoryTest {
     }
 
     @Test
-    public void shouldBeAbleToUnlockEvenWithoutLocking() throws IOException {
+    public void shouldBeAbleToUnlockEvenWithoutLocking() {
         final TaskId taskId = new TaskId(0, 0);
         directory.unlock(taskId);
     }
@@ -198,14 +187,14 @@ public class StateDirectoryTest {
         assertTrue(directory.directoryForTaskIsEmpty(taskId));
 
         // after writing checkpoint, it should still be empty
-        final OffsetCheckpoint checkpointFile = new OffsetCheckpoint(new File(directory.directoryForTask(taskId), CHECKPOINT_FILE_NAME));
+        final OffsetCheckpoint checkpointFile = new OffsetCheckpoint(new File(directory.getOrCreateDirectoryForTask(taskId), CHECKPOINT_FILE_NAME));
         assertTrue(directory.directoryForTaskIsEmpty(taskId));
 
         checkpointFile.write(Collections.singletonMap(new TopicPartition("topic", 0), 0L));
         assertTrue(directory.directoryForTaskIsEmpty(taskId));
 
         // if some store dir is created, it should not be empty
-        final File dbDir = new File(new File(directory.directoryForTask(taskId), "db"), "store1");
+        final File dbDir = new File(new File(directory.getOrCreateDirectoryForTask(taskId), "db"), "store1");
 
         Files.createDirectories(dbDir.getParentFile().toPath());
         Files.createDirectories(dbDir.getAbsoluteFile().toPath());
@@ -226,49 +215,32 @@ public class StateDirectoryTest {
 
         Utils.delete(stateDir);
 
-        assertThrows(ProcessorStateException.class, () -> directory.directoryForTask(taskId));
+        assertThrows(ProcessorStateException.class, () -> directory.getOrCreateDirectoryForTask(taskId));
     }
 
     @Test
-    public void shouldNotLockDeletedDirectory() throws IOException {
+    public void shouldNotThrowIfStateDirectoryHasBeenDeleted() throws IOException {
         final TaskId taskId = new TaskId(0, 0);
 
         Utils.delete(stateDir);
-        assertFalse(directory.lock(taskId));
+        assertThrows(IllegalStateException.class, () -> directory.lock(taskId));
     }
-    
+
     @Test
-    public void shouldLockMultipleTaskDirectories() throws IOException {
+    public void shouldLockMultipleTaskDirectories() {
         final TaskId taskId = new TaskId(0, 0);
-        final File task1Dir = directory.directoryForTask(taskId);
         final TaskId taskId2 = new TaskId(1, 0);
-        final File task2Dir = directory.directoryForTask(taskId2);
 
-
-        try (
-            final FileChannel channel1 = FileChannel.open(
-                new File(task1Dir, LOCK_FILE_NAME).toPath(),
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE);
-            final FileChannel channel2 = FileChannel.open(new File(task2Dir, LOCK_FILE_NAME).toPath(),
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE)
-        ) {
-            directory.lock(taskId);
-            directory.lock(taskId2);
-
-            assertThrows(OverlappingFileLockException.class, channel1::tryLock);
-            assertThrows(OverlappingFileLockException.class, channel2::tryLock);
-        } finally {
-            directory.unlock(taskId);
-            directory.unlock(taskId2);
-        }
+        assertThat(directory.lock(taskId), is(true));
+        assertThat(directory.lock(taskId2), is(true));
+        directory.unlock(taskId);
+        directory.unlock(taskId2);
     }
 
     @Test
     public void shouldReleaseTaskStateDirectoryLock() throws IOException {
         final TaskId taskId = new TaskId(0, 0);
-        final File taskDirectory = directory.directoryForTask(taskId);
+        final File taskDirectory = directory.getOrCreateDirectoryForTask(taskId);
 
         directory.lock(taskId);
         directory.unlock(taskId);
@@ -284,14 +256,14 @@ public class StateDirectoryTest {
     }
 
     @Test
-    public void shouldCleanUpTaskStateDirectoriesThatAreNotCurrentlyLocked() throws IOException {
+    public void shouldCleanUpTaskStateDirectoriesThatAreNotCurrentlyLocked() {
         final TaskId task0 = new TaskId(0, 0);
         final TaskId task1 = new TaskId(1, 0);
         final TaskId task2 = new TaskId(2, 0);
         try {
-            assertTrue(new File(directory.directoryForTask(task0), "store").mkdir());
-            assertTrue(new File(directory.directoryForTask(task1), "store").mkdir());
-            assertTrue(new File(directory.directoryForTask(task2), "store").mkdir());
+            assertTrue(new File(directory.getOrCreateDirectoryForTask(task0), "store").mkdir());
+            assertTrue(new File(directory.getOrCreateDirectoryForTask(task1), "store").mkdir());
+            assertTrue(new File(directory.getOrCreateDirectoryForTask(task2), "store").mkdir());
 
             directory.lock(task0);
             directory.lock(task1);
@@ -324,10 +296,9 @@ public class StateDirectoryTest {
         }
     }
 
-
     @Test
     public void shouldCleanupStateDirectoriesWhenLastModifiedIsLessThanNowMinusCleanupDelay() {
-        final File dir = directory.directoryForTask(new TaskId(2, 0));
+        final File dir = directory.getOrCreateDirectoryForTask(new TaskId(2, 0));
         assertTrue(new File(dir, "store").mkdir());
 
         final int cleanupDelayMs = 60000;
@@ -345,7 +316,7 @@ public class StateDirectoryTest {
 
     @Test
     public void shouldCleanupObsoleteStateDirectoriesOnlyOnce() {
-        final File dir = directory.directoryForTask(new TaskId(2, 0));
+        final File dir = directory.getOrCreateDirectoryForTask(new TaskId(2, 0));
         assertTrue(new File(dir, "store").mkdir());
         assertEquals(1, directory.listAllTaskDirectories().length);
         assertEquals(1, directory.listNonEmptyTaskDirectories().length);
@@ -420,8 +391,8 @@ public class StateDirectoryTest {
     @Test
     public void shouldOnlyListNonEmptyTaskDirectories() throws IOException {
         TestUtils.tempDirectory(stateDir.toPath(), "foo");
-        final File taskDir1 = directory.directoryForTask(new TaskId(0, 0));
-        final File taskDir2 = directory.directoryForTask(new TaskId(0, 1));
+        final File taskDir1 = directory.getOrCreateDirectoryForTask(new TaskId(0, 0));
+        final File taskDir2 = directory.getOrCreateDirectoryForTask(new TaskId(0, 1));
 
         final File storeDir = new File(taskDir1, "store");
         assertTrue(storeDir.mkdir());
@@ -452,7 +423,7 @@ public class StateDirectoryTest {
                 }
             }),
             time, true);
-        final File taskDir = stateDirectory.directoryForTask(new TaskId(0, 0));
+        final File taskDir = stateDirectory.getOrCreateDirectoryForTask(new TaskId(0, 0));
         assertTrue(stateDir.exists());
         assertTrue(taskDir.exists());
     }
@@ -491,17 +462,9 @@ public class StateDirectoryTest {
     @Test
     public void shouldNotLockStateDirLockedByAnotherThread() throws Exception {
         final TaskId taskId = new TaskId(0, 0);
-        final AtomicReference<IOException> exceptionOnThread = new AtomicReference<>();
-        final Thread thread = new Thread(() -> {
-            try {
-                directory.lock(taskId);
-            } catch (final IOException e) {
-                exceptionOnThread.set(e);
-            }
-        });
+        final Thread thread = new Thread(() -> directory.lock(taskId));
         thread.start();
         thread.join(30000);
-        assertNull("should not have had an exception during locking on other thread", exceptionOnThread.get());
         assertFalse(directory.lock(taskId));
     }
 
@@ -538,7 +501,7 @@ public class StateDirectoryTest {
     @Test
     public void shouldCleanupAllTaskDirectoriesIncludingGlobalOne() {
         final TaskId id = new TaskId(1, 0);
-        directory.directoryForTask(id);
+        directory.getOrCreateDirectoryForTask(id);
         directory.globalStateDir();
 
         final File dir0 = new File(appDir, id.toString());
@@ -567,7 +530,7 @@ public class StateDirectoryTest {
     public void shouldNotCreateTaskStateDirectory() throws IOException {
         initializeStateDirectory(false);
         final TaskId taskId = new TaskId(0, 0);
-        final File taskDirectory = directory.directoryForTask(taskId);
+        final File taskDirectory = directory.getOrCreateDirectoryForTask(taskId);
         assertFalse(taskDirectory.exists());
     }
 
@@ -616,7 +579,7 @@ public class StateDirectoryTest {
     @Test
     public void shouldLogManualUserCallMessage() {
         final TaskId taskId = new TaskId(0, 0);
-        final File taskDirectory = directory.directoryForTask(taskId);
+        final File taskDirectory = directory.getOrCreateDirectoryForTask(taskId);
         final File testFile = new File(taskDirectory, "testFile");
         assertThat(testFile.mkdir(), is(true));
         assertThat(directory.directoryForTaskIsEmpty(taskId), is(false));
@@ -633,7 +596,7 @@ public class StateDirectoryTest {
     @Test
     public void shouldLogStateDirCleanerMessage() {
         final TaskId taskId = new TaskId(0, 0);
-        final File taskDirectory = directory.directoryForTask(taskId);
+        final File taskDirectory = directory.getOrCreateDirectoryForTask(taskId);
         final File testFile = new File(taskDirectory, "testFile");
         assertThat(testFile.mkdir(), is(true));
         assertThat(directory.directoryForTaskIsEmpty(taskId), is(false));
@@ -642,7 +605,7 @@ public class StateDirectoryTest {
             final long cleanupDelayMs = 0;
             time.sleep(5000);
             directory.cleanRemovedTasks(cleanupDelayMs);
-            assertThat(appender.getMessages(), hasItem(endsWith("ms has elapsed (cleanup delay is " +  cleanupDelayMs + "ms).")));
+            assertThat(appender.getMessages(), hasItem(endsWith("ms has elapsed (cleanup delay is " + cleanupDelayMs + "ms).")));
         }
     }
 
@@ -662,9 +625,75 @@ public class StateDirectoryTest {
             assertThat(
                 appender.getMessages(),
                 hasItem("Using an OS temp directory in the state.dir property can cause failures with writing the" +
-                    " checkpoint file due to the fact that this directory can be cleared by the OS." +
-                    " Resolved state.dir: [/tmp/kafka-streams]")
+                            " checkpoint file due to the fact that this directory can be cleared by the OS." +
+                            " Resolved state.dir: [" + System.getProperty("java.io.tmpdir") + "/kafka-streams]")
             );
+        }
+    }
+
+    @Test
+    public void shouldPersistProcessIdAcrossRestart() {
+        final UUID processId = directory.initializeProcessId();
+        directory.close();
+        assertThat(directory.initializeProcessId(), equalTo(processId));
+    }
+
+    @Test
+    public void shouldGetFreshProcessIdIfProcessFileDeleted() {
+        final UUID processId = directory.initializeProcessId();
+        directory.close();
+
+        final File processFile = new File(appDir, PROCESS_FILE_NAME);
+        assertThat(processFile.exists(), is(true));
+        assertThat(processFile.delete(), is(true));
+
+        assertThat(directory.initializeProcessId(), not(processId));
+    }
+
+    @Test
+    public void shouldGetFreshProcessIdIfJsonUnreadable() throws Exception {
+        final File processFile = new File(appDir, PROCESS_FILE_NAME);
+        assertThat(processFile.createNewFile(), is(true));
+        final UUID processId = UUID.randomUUID();
+
+        final FileOutputStream fileOutputStream = new FileOutputStream(processFile);
+        try (final BufferedWriter writer = new BufferedWriter(
+            new OutputStreamWriter(fileOutputStream, StandardCharsets.UTF_8))) {
+            writer.write(processId.toString());
+            writer.flush();
+            fileOutputStream.getFD().sync();
+        }
+
+        assertThat(directory.initializeProcessId(), not(processId));
+    }
+
+    @Test
+    public void shouldReadFutureProcessFileFormat() throws Exception {
+        final File processFile = new File(appDir, PROCESS_FILE_NAME);
+        final ObjectMapper mapper = new ObjectMapper();
+        final UUID processId = UUID.randomUUID();
+        mapper.writeValue(processFile, new FutureStateDirectoryProcessFile(processId, "some random junk"));
+
+        assertThat(directory.initializeProcessId(), equalTo(processId));
+    }
+
+    private static class FutureStateDirectoryProcessFile {
+
+        @JsonProperty
+        private final UUID processId;
+
+        @JsonProperty
+        private final String newField;
+
+        public FutureStateDirectoryProcessFile() {
+            this.processId = null;
+            this.newField = null;
+        }
+
+        FutureStateDirectoryProcessFile(final UUID processId, final String newField) {
+            this.processId = processId;
+            this.newField = newField;
+
         }
     }
 
@@ -686,7 +715,7 @@ public class StateDirectoryTest {
         @Override
         public void run() {
             try {
-                taskDirectory = directory.directoryForTask(taskId);
+                taskDirectory = directory.getOrCreateDirectoryForTask(taskId);
             } catch (final ProcessorStateException error) {
                 passed.set(false);
             }
